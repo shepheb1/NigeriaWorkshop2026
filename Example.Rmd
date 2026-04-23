@@ -1,0 +1,296 @@
+---
+title: 'Longitudinal Data Analysis with R Statistical Software'
+subtitle: 'GEE and mixed-effects models'
+author: "Benjamin French and Bryan Shepherd"
+date: 'April 27 -- May 1, 2026'
+output:
+  rmdformats::robobook:
+    thumbnails: no
+    lightbox: true
+    gallery: no
+    highlight: tango
+    use_bookdown: no
+    toc_depth: 2
+    fig_caption: yes
+    code_folding: hide
+    embed_fonts: no
+    keep_md: false
+    number_sections: true
+---
+
+```{r options, echo=FALSE}
+options(width = 110)
+```
+
+This file provides an analysis in [R](http://www.r-project.org) of the data collected from a randomized controlled trial of treatment with D-penicillamine for [primary biliary cirrhosis](http://en.wikipedia.org/wiki/Primary_biliary_cholangitis) (PBC), now primary biliary cholangitis, a rare autoimmune liver disease.
+
+**Disclaimer**: because this is a didactic exercise, we will consider a range of potential models. In practice, model fitting should be guided by *a priori* scientific knowledge and exploratory data analysis, and should be directly relevant to the scientific question of interest.
+
+# Preliminaries
+
+First, install the <tt>[geepack](http://cran.r-project.org/web/packages/geepack/index.html)</tt>, <tt>[lme4](http://cran.r-project.org/web/packages/lme4/index.html)</tt>, <tt>[dplyr](https://cran.r-project.org/web/packages/dplyr/index.html)</tt>, <tt>[ggplot2](https://cran.r-project.org/web/packages/ggplot2/index.html)</tt>, and <tt>[JM](http://cran.r-project.org/web/packages/JM/index.html)</tt> extension packages.
+
+```{r install, cache=TRUE, results='hide'}
+install.packages(c('geepack', 'lme4', 'dplyr', 'ggplot2', 'JM'), repos='https://cloud.r-project.org')
+```
+
+Next, load these packages. I also included some options for graphics as a user-specified function. (Some of the figures in this document are meant to be of publication quality, while others are only used for exploring the data and evaluating fitted models.)
+
+```{r packages2, message=FALSE}
+library(geepack)
+library(lme4)
+library(dplyr)
+library(ggplot2)
+library(JM)
+
+theme_set(theme_bw())
+mytheme <- function(...){
+  theme(panel.grid.minor=element_blank(),
+        plot.margin=unit(c(0.5, 0.5, 0.5, 0.5), 'lines'),
+        axis.title.x=element_text(size=12, vjust=0),
+        axis.title.y=element_text(size=12, vjust=1, angle=90),
+        legend.title=element_text(size=12, face='bold'),
+        legend.text=element_text(size=12),
+        legend.position='top', legend.direction='horizontal', 
+        legend.key=element_blank(),
+        legend.key.width=unit(1.5,"cm"),
+        legend.key.height=unit(0.35,'cm'),
+        strip.text.y=element_text(size=12))}
+```
+
+# PBC data
+
+The PBC data are provided as part of the <tt>JM</tt> extension package. Note that there is a help file for the dataset that can be accessed using <tt>?pbc2</tt>. The dataset is in so-called long format, in which each participant has multiple rows, with each row corresponding to a measurement time. The data are sorted by <tt>id</tt> and <tt>year</tt>; software packages for longitudinal data analysis typically assume that the data are properly sorted.
+
+```{r pbc2_data}
+data(pbc2)
+head(pbc2, 11)
+str(pbc2)
+```
+
+Data are available for 312 study participants, with an unequal number of observations per participant. Calculate various summary statistics for the number of observations per participant.
+
+```{r pbc_nobs, message=FALSE}
+pbc2 |>
+  group_by(id) |>
+  summarize(m=sum(!is.na(albumin))) |>
+  summarize(min(m), median(m), max(m))
+
+subset(pbc2, !is.na(albumin)) |> 
+  count(id, name='m') -> num
+with(num, table(m))
+```
+
+This analysis will focus on serum albumin levels as a measure of liver function (*lower* values indicate decreased liver function). Using <tt>ggplot</tt>, plot the observed serum albumin levels over time for the first 16 study participants, along with a linear regression line.
+
+```{r pbc_plot_panels}
+ggplot(subset(pbc2, is.element(id, 1:16)), aes(year, albumin)) +
+  facet_wrap( ~ id) +
+  geom_point() +
+  geom_smooth(se=FALSE, method='lm') + 
+  scale_x_continuous(name='Time, years', limits=c(0,15)) +
+  scale_y_continuous(name='Serum albumin, g/dl') +
+  mytheme()
+```
+
+Note that there are other options for scatterplot smoothers; see <tt>?geom_smooth</tt> for details.
+
+# Exploratory data analysis
+
+With longitudinal data, exploratory data analysis should focus on both the mean (e.g., how the average outcome changes over time, whether the change over time differs between groups) and covariance (i.e., the variance in the outcome and the correlation between repeated measures). First, explore the mean by plotting the observed individual-level profiles (or, trajectories) in albumin level over time, along with a smoothing line for each treatment group to display the average trend.
+
+```{r pbc_plot_lines, message=FALSE}
+pbc2 <- within(pbc2, {
+  levels(drug) <- c('Placebo', 'Treatment')})
+
+ggplot(subset(pbc2, albumin<6), aes(year, albumin, group=id)) +
+  geom_line(aes(color=drug), alpha=0.4) +
+  geom_smooth(aes(year, albumin, group=drug, color=drug), se=FALSE, linewidth=1.5) +
+  scale_x_continuous(name='Time, years', limits=c(0,15)) +
+  scale_y_continuous(name='Serum albumin, g/dl') + 
+  scale_color_manual(name='Intervention', values=c('#00BFC4', '#F8766D')) +
+  mytheme()
+```
+
+Next, calculate summary statistics for the variance in albumin levels and correlation between pairs of albumin measurements. Such summary statistics can be obtained by reshaping the dataset into so-called wide format, in which each participant has a single row of data, but multiple columns, with each column corresponding to a measurement time.
+
+```{r pbc_reshape, message=FALSE}
+pbc2 |> 
+  group_by(id) |> 
+  mutate(obs_num = row_number()) |>
+  ungroup() |>
+  as.data.frame() -> pbc2
+
+pbc2_wide <- reshape(subset(pbc2, select=c(id, obs_num, albumin)),
+                     v.names='albumin', idvar='id', timevar='obs_num', direction='wide')
+head(pbc2_wide, 2)
+```
+
+The commands for calculating variances and correlations, as well as the number of observations at each pair of measurement times (or 'pairwise complete' observations), are somewhat inelegant and not displayed below. Note that for the purposes of illustration, I restricted the calculation to the first 8 pairs of measurements.
+
+```{r pbc_corr, echo=FALSE, message=FALSE}
+ntime <- 8
+rmat <- with(pbc2_wide, cbind(albumin.1, albumin.2, albumin.3, albumin.4, albumin.5, albumin.6, albumin.7, albumin.8))
+	
+vmat <- nmat <- covmatj <- covmatk <- matrix(0, nrow=ntime, ncol=ntime)
+rownames(vmat) <- colnames(vmat) <- 1:ntime
+rownames(nmat) <- colnames(nmat) <- 1:ntime
+
+for(j in 1:ntime){
+    for(k in 1:ntime){
+        nmat[j,k] <- sum(!is.na(rmat[,j]*rmat[,k]))
+        vmat[j,k] <- cov(rmat[,j],rmat[,k],use="pairwise.complete.obs")
+        if(nmat[j,k]>0) covmatj[j,k] <- cov(rmat[,j][!is.na(rmat[,j]*rmat[,k])],rmat[,j][!is.na(rmat[,j]*rmat[,k])],use="pairwise.complete.obs")
+        if(nmat[j,k]>0) covmatk[j,k] <- cov(rmat[,k][!is.na(rmat[,j]*rmat[,k])],rmat[,k][!is.na(rmat[,j]*rmat[,k])],use="pairwise.complete.obs")
+	}}
+
+cmat <- vmat/sqrt(covmatj)/sqrt(covmatk)
+
+round(diag(vmat),2)
+round(cmat, 2)
+nmat
+```
+
+When interpreting these summary statistics, remember that the data are unbalanced and not equally spaced. Data collection occurred approximately every 6 months for the first year, and yearly thereafter.
+
+# Estimating equations
+
+Using <tt>geeglm</tt>, fit a series of models based on (generalized) estimating equations, considering alternative specifications for the mean model (i.e., main effects of treatment and time, treatment-by-time interaction) and alternative specifications for the correlation model (i.e., independence, exchangeable). In addition to the typical <tt>formula</tt> and <tt>data</tt> arguments, <tt>geeglm</tt> requires the following arguments: <tt>family</tt>, to specify the error distribution and link function; <tt>id</tt>, to identify the clustering variable; and <tt>corstr</tt>, to specify the correlation model. See <tt>?geeglm</tt> for details
+
+```{r gee_models}
+# Main effects of treatment and time, independence correlation
+gee_m1 <- geeglm(formula=albumin ~ drug + year, family='gaussian', 
+                 data=pbc2, id=id, corstr='independence')
+summary(gee_m1)
+
+# Main effects of treatment and time, exchangeable correlation
+gee_m2 <- geeglm(formula=albumin ~ drug + year,  family='gaussian', 
+                 data=pbc2, id=id, corstr='exchangeable')
+summary(gee_m2)
+
+# Interaction between treatment and time, exchangeable correlation
+gee_m3 <- geeglm(formula=albumin ~ drug*year, family='gaussian', 
+                 data=pbc2, id=id, corstr='exchangeable')
+summary(gee_m3)
+
+# Treatment-specific time effects, exchangeable correlation
+gee_m4 <- geeglm(formula=albumin ~ drug:year, family='gaussian', 
+                 data=pbc2, id=id, corstr='exchangeable')
+summary(gee_m4)
+
+# 95% confidence intervals
+broom::tidy(gee_m4, conf.int=TRUE)
+```
+
+```{r gee_results, echo=FALSE}
+beta_0 <- coef(gee_m4)[1]
+beta_1 <- coef(gee_m4)[2]
+beta_2 <- coef(gee_m4)[3]
+```
+
+According to the model with treatment-specific time effects and an exchangeable correlation model (<tt>gee_m4</tt>), the mean albumin level at baseline (time 0) is `r round(beta_0, 2)` g/dl. For the placebo group, a one-year increase in time is associated with a `r round(abs(beta_1), 3)` g/dl decrease in albumin levels. For the treatment group, a one-year increase in time is associated with a `r round(abs(beta_2), 3)` g/dl decrease in bilirubin levels. There is no evidence that the average trend in albumin levels differs between the placebo and treatment groups.
+
+Residual analysis can be used to evaluate the adequacy of a fitted model.
+
+```{r gee_diagnostics}
+plot(pbc2$year, residuals(gee_m4), xlab='Time, years', ylab='Residuals')
+abline(h=0, col='gray', lwd=2)
+lines(lowess(pbc2$year, residuals(gee_m4)), col='red', lwd=2)
+```
+
+Ignoring the two outliers, which in practice we would treat more seriously, assumptions regarding the mean model do not appear to be satisfied (the lowess smoother does not approximate the flat line at 0). Therefore, we will evaluate whether an alternative specification for the mean model provides a better fit. In particular, in the plot of observed individual-level profiles in albumin level over time, the scatterplot smoothers suggested a non-linear association between time and albumin level for both the treatment and placebo groups. Consider adding quadratic terms for time to the 'preferred' model.
+
+```{r quad_models}
+gee_m5 <- geeglm(formula=albumin ~ drug:year + drug:I(year^2), family='gaussian',
+                 data=pbc2, id=id, corstr='exchangeable', scale.fix=TRUE)
+anova(gee_m5)
+
+plot(pbc2$year, residuals(gee_m5), xlab='Time, years', ylab='Residuals')
+abline(h=0, col='gray', lwd=2)
+lines(lowess(pbc2$year, residuals(gee_m5)), col='red', lwd=2)
+```
+
+# Mixed-effects models
+
+Using <tt>lmer</tt>, fit a series a linear mixed-effects models, considering alternative specifications for the mean model (i.e., main effects of treatment and time, treatment-by-time interaction) and alternative specifications for the random effects (i.e., random intercepts only, or random intercepts and random slopes). Note that random-effects terms are included in the <tt>formula</tt> argument and are distinguished by a vertical bar that separates expressions for covariates (1 for random intercepts only) from grouping factors; see <tt>?lmer</tt> for details. (To fit generalized linear mixed-effects models for count or binary outcomes, use <tt>glmer</tt>; see <tt>?glmer</tt> for details.)
+
+```{r lme_models}
+# Main effects of treatment and time, random intercepts
+lme_m1 <- lmer(formula=albumin ~ (1 | id) + drug + year, data=pbc2)
+summary(lme_m1)
+
+# Interaction between treatment and time, random intercepts
+lme_m2 <- lmer(formula=albumin ~ (1 | id) + drug*year, data=pbc2)
+summary(lme_m2)
+
+# Treatment-specific time effects, random intercepts
+lme_m3 <- lmer(formula=albumin ~ (1 | id) + drug:year, data=pbc2)
+summary(lme_m3)
+
+# Treatment-specific time effects, random intercepts + slopes
+lme_m4 <- lmer(formula=albumin ~ (year | id) + drug:year, data=pbc2)
+summary(lme_m4)
+
+# 95% confidence intervals
+confint(lme_m4, parm='beta_')
+
+# Likelihood ratio test for inclusion of random slopes
+anova(lme_m4, lme_m3)
+```
+
+```{r lme_results, echo=FALSE}
+beta_0 <- fixef(lme_m4)[1]
+beta_1 <- fixef(lme_m4)[2]
+beta_2 <- fixef(lme_m4)[3]
+D_11 <- as.data.frame(VarCorr(lme_m4))[1,5]
+D_22 <- as.data.frame(VarCorr(lme_m4))[2,5]
+```
+
+I prefer the model with treatment-specific time effects and random intercepts and slopes (<tt>lme_m4</tt>). At baseline, the mean albumin level is `r round(beta_0, 2)` g/dl, which is constrained to be equal between the treatment groups. There is modest heterogeneity in albumin levels at baseline; compare $\hat{\beta}_0=`r round(beta_0, 2)`$ to $\hat{D}_{11}=`r round(D_11, 2)`^2$. Note that $`r round(beta_0, 2)` \pm 1.96\times `r round(D_11, 2)` = (`r round(beta_0 - 1.96*D_11, 2)`, `r round(beta_0 + 1.96*D_11, 2)`)$ g/dl quantifies variability across participants in albumin levels at baseline. NB: this is *not* a confidence interval for $\beta_0$.
+
+For the placebo group, a one-year increase in time is associated with a `r round(abs(beta_1), 3)` g/dl decrease in albumin levels. For the treatment group, a one-year increase in time is associated with a `r round(abs(beta_2), 3)` g/dl decrease in bilirubin levels. There is no evidence that the average trend in albumin levels differs between the placebo and treatment groups.
+
+There is substantial heterogeneity in albumin trends over time; compare $\hat{\beta}_1=`r round(beta_1, 3)`$ and $\hat{\beta}_2=`r round(beta_2, 3)`$ to $\hat{D}_{22}=`r round(D_22, 3)`^2$. Note that $`r round(beta_1, 3)` \pm 1.96\times `r round(D_22, 3)` = ( `r round(beta_1 - 1.96*D_22, 3)`, `r round(beta_1 + 1.96*D_22, 3)`)$ and $`r round(beta_2, 3)` \pm 1.96\times `r round(D_22, 3)` = (`r round(beta_2 - 1.96*D_22, 3)`, `r round(beta_2 + 1.96*D_22, 3)`)$ quantify the variability across participants in the per-year decrease in albumin levels among the placebo and treatment groups, respectively.
+
+R programming note: everything in R is an object. Objects have classes. A call to <tt>lmer</tt> (and <tt>glmer</tt>) create an object of class <tt>merMod</tt>. There are functions to extract components from objects of class <tt>merMod</tt>, such as <tt>fixef</tt> and <tt>ranef</tt> to extract the fixed-effects and random-effects estimates, respectively. See <tt>methods(class="merMod")</tt> for details.
+
+Residual analysis can be used to evaluate the adequacy of a fitted model. See <tt>?residuals.merMod</tt> and <tt>?fitted.merMod</tt> for details on extracting the residuals and fitted values, respectively, from a <tt>merMod</tt> object.
+
+```{r lme_diagnostics}
+plotResid <- function(x, y, col.lowess='red', ...){
+  plot(x, y, ...)
+  abline(h=0, col='gray', lwd=2)
+  lines(lowess(x, y), col=col.lowess, lwd=2)}
+plotQQ <- function(x, ...){
+  qqnorm(x, ...)
+  qqline(x, col='gray', lwd=2)}
+
+par(mfrow=c(2,2), mar=c(5,5,2,1))
+plotResid(fitted(lme_m4), residuals(lme_m4), xlab='Fitted values', ylab='Residuals')
+plotQQ(residuals(lme_m4), main='Residuals')
+plotQQ(ranef(lme_m4)$id[,1], main='Random intercepts')
+plotQQ(ranef(lme_m4)$id[,2], main='Random slopes')
+```
+
+Ignoring the two outliers, which in practice we would treat more seriously, assumptions regarding the mean model (the red lowess smoother approximates the flat line at 0) and Normality appear to be satisfied.
+
+In the plot of observed individual-level profiles in albumin level over time, the scatterplot smoothers suggested a non-linear association between time and albumin level for both the treatment and placebo groups. Consider adding quadratic terms for time to the 'preferred' models.
+
+```{r quad_models2}
+library(geepack)
+gee_m5 <- geeglm(formula=albumin ~ drug:year + drug:I(year^2), family='gaussian',
+                 data=pbc2, id=id, corstr='exchangeable', scale.fix=TRUE)
+anova(gee_m5)
+
+lme_m5 <- lmer(formula=albumin ~ (year | id) + drug:year + drug:I(year^2), data=pbc2)
+anova(lme_m5, lme_m4)
+```
+
+What could explain the disparity in these results? Hint: consider why participants are lost to follow-up.
+
+# End matter
+
+This file was created from:
+```{r session_info, echo=FALSE}
+print(sessionInfo(), locale = FALSE)
+```
