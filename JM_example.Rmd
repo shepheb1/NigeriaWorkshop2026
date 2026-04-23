@@ -1,0 +1,444 @@
+---
+title: 'Longitudinal Data Analysis with R Statistical Software'
+subtitle: 'Joint models for longitudinal and survival data'
+author: "Benjamin French and Bryan Shepherd"
+date: 'April 27 -- May 1, 2026'
+output:
+  rmdformats::robobook:
+    thumbnails: no
+    lightbox: true
+    gallery: no
+    highlight: tango
+    use_bookdown: no
+    toc_depth: 2
+    fig_caption: yes
+    code_folding: hide
+    embed_fonts: no
+    keep_md: false
+    number_sections: true
+---
+
+```{r options, echo=FALSE}
+options(width = 110)
+```
+
+This file provides an analysis in [R](http://www.r-project.org) of the data collected from a randomized controlled trial of treatment with D-penicillamine for [primary biliary cirrhosis](http://en.wikipedia.org/wiki/Primary_biliary_cholangitis) (PBC), a rare autoimmune liver disease.
+
+**Disclaimer**: because this is a didactic exercise, we will consider a range of potential models. In practice, model fitting should be guided by *a priori* scientific knowledge and exploratory data analysis, and should be directly relevant to the scientific question of interest.
+
+# Preliminaries
+
+First, install the <tt>[JM](http://cran.r-project.org/web/packages/JM/index.html)</tt>, <tt>[ggplot2](https://cran.r-project.org/web/packages/ggplot2/index.html)</tt>, <tt>[survminer](https://cran.r-project.org/web/packages/survminer/index.html)</tt>, and <tt>[dplyr](https://cran.r-project.org/web/packages/dplyr/index.html)</tt> extension packages.
+
+```{r install, cache=TRUE, results='hide'}
+install.packages(c('JM', 'ggplot2', 'survminer', 'dplyr'), repos='https://cloud.r-project.org')
+```
+
+Next, load these packages. Note that the <tt>JM</tt> package automatically loads the <tt>nlme</tt> (for fitting mixed-effects models) and <tt>survival</tt> (for fitting Cox regression models) extension packages, among others. I also included some options for graphics as a user-specified function. (Some of the figures in this document are meant to be of publication quality, while others are only used for exploring the data and evaluating fitted models.)
+
+```{r packages1}
+library(JM)
+```
+
+```{r packages2, message=FALSE}
+library(ggplot2)
+library(survminer)
+library(dplyr)
+
+theme_set(theme_bw())
+mytheme <- function(...){
+  theme(panel.grid.minor=element_blank(),
+        plot.margin=unit(c(0.5, 0.5, 0.5, 0.5), 'lines'),
+        axis.title.x=element_text(size=12, vjust=0),
+        axis.title.y=element_text(size=12, vjust=1, angle=90),
+        legend.title=element_text(size=12, face='bold'),
+        legend.text=element_text(size=12),
+        legend.position='top', legend.direction='horizontal', 
+        legend.key=element_blank(),
+        legend.key.width=unit(1.5,"cm"),
+        legend.key.height=unit(0.35,'cm'),
+        strip.text.y=element_text(size=12))}
+```
+
+# PBC data
+
+The PBC data are provided as part of the <tt>JM</tt> extension package. Note that there is a help file for the dataset that can be accessed using <tt>?pbc2</tt>. The dataset is in so-called long format, in which each participant has multiple rows, with each row corresponding to a measurement time.
+
+```{r pbc2_data}
+data(pbc2)
+head(pbc2, 11)
+str(pbc2)
+```
+
+Data are available for 312 study participants, with an unequal number of observations per participant.
+
+```{r pbc_nobs, message=FALSE}
+subset(pbc2, !is.na(serBilir)) |> 
+  count(id, name='m') -> num
+with(num, table(m))
+```
+
+This analysis will focus on serum bilirubin levels as a measure of liver function (*higher* values indicate decreased liver function). A histogram of bilirubin levels at baseline (<tt>year</tt> 0) does not exhibit a symmetric distribution.
+
+```{r pbc_hist, message=FALSE}
+pbc2 <- within(pbc2, {
+  levels(drug) <- c('Placebo', 'Treatment')})
+  
+ggplot(subset(pbc2, year==0), aes(x=serBilir)) +
+  geom_histogram(color='black', fill='white') +
+  facet_wrap(~ drug) +
+  scale_x_continuous(name='Serum bilirubin, mg/dl') +
+  scale_y_continuous(name='Count') +
+  mytheme()
+```
+
+Using <tt>ggplot</tt>, plot the observed serum bilirubin levels over time for the first 16 study participants, along with a linear regression line and an indicator of when the participant died or was censored. (Liver transplantation is included as a censoring event, which we could debate.) Note that because bilirubin levels are positively skewed, the y axis is displayed on the log (base 10) scale.
+
+```{r pbc_plot_panels}
+ggplot(subset(pbc2, is.element(id, 1:16)), aes(year, serBilir)) +
+  facet_wrap( ~ id) +
+  geom_vline(aes(xintercept=years, color=factor(status!='dead')), lwd=1) + 
+  geom_point() +
+  geom_smooth(se=FALSE, method='lm') + 
+  scale_x_continuous(name='Time, years', limits=c(0,15)) +
+  scale_y_continuous(trans='log10', name='Serum bilirubin, mg/dl') + 
+  scale_colour_manual(name='Status', breaks=c(FALSE, TRUE), values=c('red', 'darkgray'),
+                      labels=c('Death', 'Censored')) +
+  mytheme()
+```
+
+Note that there are other options for scatterplot smoothers; see <tt>?geom_smooth</tt> for details.
+
+# Longitudinal data analysis
+
+First, using <tt>ggplot</tt>, plot the observed individual-level profiles (or, trajectories) in bilirubin level over time, along with a smoothing line for each treatment group to display the average trend.
+
+```{r pbc_plot_lines, message=FALSE}
+ggplot(pbc2, aes(year, serBilir, group=id)) +
+  geom_line(aes(color=drug), alpha=0.4) +
+  geom_smooth(aes(year, serBilir, group=drug, color=drug), se=FALSE, linewidth=1.5) +
+  scale_x_continuous(name='Time, years', limits=c(0,15)) +
+  scale_y_continuous(trans='log10', name='Serum bilirubin, mg/dl') + 
+  scale_color_manual(name='Intervention', values=c('#00BFC4', '#F8766D')) +
+  mytheme()
+```
+
+Next, using <tt>lme</tt>, fit a series a linear mixed-effects models, considering alternative specifications for the mean model (i.e., main effects of treatment and time, treatment-by-time interaction) and alternative specifications for the random effects (i.e., random intercepts only, or random intercepts and random slopes). Note that because bilirubin levels are log-transformed, coefficient estimates correspond to differences on the log scale. Exponentiate those coefficients to obtain ratios in bilirubin levels. Math facts: $\log(a)-\log(b)=\log(a/b)$ and $\exp\{\log(a/b)\}=a/b$.
+
+```{r lme_models}
+# Main effects of treatment and time, random intercepts
+ml1 <- lme(log(serBilir) ~ drug + year, random = ~ 1 | id, data=pbc2)
+summary(ml1)
+
+# Interaction between treatment and time, random intercepts
+ml2 <- lme(log(serBilir) ~ drug*year, random = ~ 1 | id, data=pbc2)
+summary(ml2)
+
+# Treatment-specific time effects, random intercepts
+ml3 <- lme(log(serBilir) ~ year + drug:year, random = ~ 1 | id, data=pbc2)
+summary(ml3)
+
+# Treatment-specific time effects, random intercepts + slopes
+ml4 <- lme(log(serBilir) ~ year + drug:year, random = ~ year | id, data=pbc2)
+summary(ml4)
+
+# 95% confidence intervals
+intervals(ml4)
+exp(intervals(ml4)$fixed)
+
+# Likelihood ratio test for inclusion of random slopes
+anova(ml4, ml3)
+```
+
+```{r lme_results, echo=FALSE}
+beta_0 <- fixef(ml4)[1]
+beta_1 <- fixef(ml4)[2]
+beta_2 <- fixef(ml4)[3]
+D_11 <- as.numeric(VarCorr(ml4)[1,2])
+D_22 <- as.numeric(VarCorr(ml4)[2,2])
+pvals <- summary(ml4)$tTable[,5]
+```
+
+I prefer the model with treatment-specific time effects and random intercepts and slopes (<tt>ml4</tt>). At baseline, the mean bilirubin level is $\exp(`r round(beta_0, 3)`)=`r round(exp(beta_0), 3)`$ mg/dl, which is constrained to be equal between the treatment groups. There is substantial heterogeneity in bilirubin levels at baseline; compare $\hat{\beta}_0=`r round(beta_0, 3)`$ to $\hat{D}_{11}=`r round(D_11, 3)`^2$. Note that $\exp(`r round(beta_0, 3)` \pm 1.96\times `r round(D_11, 3)`) = (`r round(exp(beta_0 - 1.96*D_11), 3)`, `r round(exp(beta_0 + 1.96*D_11), 3)`)$ mg/dl quantifies variability across participants in bilirubin levels at baseline. NB: this is *not* a confidence interval for $\beta_0$.
+
+For the placebo group, a one-year increase in time is associated with a $\exp(`r round(beta_1, 3)`)=`r round(exp(beta_1), 3)`$-factor increase in bilirubin levels. For the treatment group, a one-year increase in time is associated with a $\exp(`r round(beta_1 + beta_2, 3)`)=`r round(exp(beta_1 + beta_2), 3)`$-factor increase in bilirubin levels. There is no evidence that the average trend in bilirubin levels differs between the placebo and treatment groups $(P = `r round(pvals[3], 2)`)$.
+
+There is substantial heterogeneity in bilirubin trends over time; compare $\hat{\beta}_1=`r round(beta_1, 3)`$ and $(\hat{\beta}_1 + \hat{\beta}_2)=`r round(beta_1 + beta_2, 3)`$ to $\hat{D}_{22}=`r round(D_22, 3)`^2$. Note that $\exp(`r round(beta_1, 3)` \pm 1.96\times `r round(D_22, 3)`) = ( `r round(exp(beta_1 - 1.96*D_22), 3)`, `r round(exp(beta_1 + 1.96*D_22), 3)`)$ and $\exp(`r round(beta_1 + beta_2,3)` \pm 1.96\times `r round(D_22, 3)`) = (`r round(exp(beta_1 + beta_2 - 1.96*D_22), 3)`, `r round(exp(beta_1 + beta_2 + 1.96*D_22), 3)`)$ quantify the variability across participants in the per-year increase in bilirubin levels among the placebo and treatment groups, respectively.
+
+# Survival data analysis
+
+## Standard Cox model
+
+For fitting standard Cox regression models to the PBC data, a dataset is available that only includes a single row for each participant that contains the covariate values at baseline, survival time, and event indicator.  
+
+```{r pbc2.id_data}
+data(pbc2.id)
+head(pbc2.id, 2)
+```
+
+First, using <tt>survminer</tt>, produce a Kaplan-Meier plot to display the survival probability over time for males and females. The figure includes confidence intervals for the survival probability, vertical dashes that indicate censoring events, and a table of the number of participants at risk below the figure. (A similar figure stratified by treatment group is less interesting.)
+
+```{r km_plot, warning=FALSE}
+km <- survfit(Surv(years, status=='dead') ~ sex, data=pbc2.id)
+
+ggsurvplot(km, data=pbc2.id, xlab='Time, years',
+           conf.int=TRUE, risk.table=TRUE, risk.table.y.text=FALSE,
+           ggtheme=theme(panel.grid.minor=element_blank()), tables.height=0.15,
+           tables.theme=theme(panel.border = element_blank(), 
+                              panel.grid.major=element_blank(),
+                              axis.title.x=element_blank(),
+                              axis.title.y=element_blank(),
+                              axis.text.x=element_blank(),
+                              axis.ticks.x=element_blank()),
+           legend.title='Sex', legend.labs=c('Male', 'Female'),
+           palette=c('#F8766D', '#00BFC4'))
+```
+
+Next, use <tt>coxph</tt> to fit a series of Cox regression models, with and without adjustment for bilirubin level at baseline. Later, we will use <tt>ms1</tt> for fitting joint regression models, which requires the <tt>x=TRUE</tt> argument. Use <tt>cox.zph</tt> to evaluate the proportional hazards assumption.
+
+```{r cox_models}
+# Standard Cox model with treatment; note x=TRUE argument
+ms1 <- coxph(Surv(years, status=='dead') ~ drug + sex + I(age-50), data=pbc2.id, x=TRUE)
+summary(ms1)
+
+# Standard Cox model with treatment and baseline bilirubin
+ms2 <- coxph(Surv(years, status=='dead') ~ drug + sex + I(age-50) + log(serBilir), data=pbc2.id)
+summary(ms2)
+
+# Check proportional hazards assumption
+cox.zph(ms2)
+plot(cox.zph(ms2)[4]) # Selects the fourth variable (bilirubin)
+```
+
+```{r cox_results, echo=FALSE}
+gamma_1 <- coef(ms2)[1]
+gamma_2 <- coef(ms2)[2]
+gamma_3 <- coef(ms2)[3]
+gamma_4 <- coef(ms2)[4]
+```
+
+According to the model that includes baseline serum bilirubin (<tt>ms2</tt>):
+
+* $\exp(`r round(gamma_1, 3)`) = `r round(exp(gamma_1), 3)`$ is the hazard ratio comparing the hazard of death between the treatment and placebo groups.
+* $\exp(`r round(gamma_2, 3)`) = `r round(exp(gamma_2), 3)`$ is the hazard ratio comparing the hazard of death between females and males.
+* $\exp(`r round(gamma_3, 3)`) = `r round(exp(gamma_3), 3)`$ is the hazard ratio comparing the hazard of death for each one-year increase in age.
+* $\exp(`r round(gamma_4, 3)`) = `r round(exp(gamma_4), 3)`$ is the hazard ratio comparing the hazard of death for each one-unit increase in log bilirubin. Note that an additive difference on the log scale is a multiplicative difference on the original scale. Math fact: $\exp(1)\approx`r round(exp(1),3)`$.
+
+There is no evidence for violation of the proportional hazards assumption. We fail to reject the null hypothesis of proportional hazards. The figure indicates approximately constant (log) hazard ratios over time for serum bilirubin.
+
+## Extended Cox model
+
+Above, we plotted the observed individual-level profiles (or, trajectories) in bilirubin level over *time since randomization*, to explore how bilirubin level changed over time. To explore how bilirubin levels are associated with risk of death, plot the observed individual-level profiles in bilirubin level over *time from the end of follow-up* (subtract the event time <tt>years</tt> from the visit time <tt>year</tt>), stratified by follow-up status (died or censored), along with a smoothing line for each treatment group to display the average trend. 
+
+```{r plot_bili_surv}
+pbc2 <- within(pbc2, {
+  status.lab <- ifelse(status=='dead', 'Died', 'Censored')})
+
+ggplot(pbc2, aes(year-years, serBilir, group=id)) +
+  facet_wrap( ~ status.lab) +
+  geom_line(aes(color=drug), alpha=0.4) +
+  geom_smooth(aes(year-years, serBilir, group=drug, color=drug), se=FALSE, linewidth=1.5) +
+  scale_x_continuous(name='Time from end of follow-up, years', limits=c(-15,0)) +
+  scale_y_continuous(trans='log10', name='Serum bilirubin, mg/dl') + 
+  scale_color_manual(name='Intervention', values=c('#00BFC4', '#F8766D')) +
+  mytheme()
+```
+
+For fitting extended Cox models with serum bilirubin as a time-dependent covariate, a dataset is required that includes the start times and stop times for each time interval. This can be achieved using <tt>tmerge</tt>; see <tt>?tmerge</tt> for details.
+
+```{r pbc_startstop_data}
+temp <- subset(pbc2.id, select=c(id, years, status, drug, sex, age, serBilir))
+temp <- tmerge(temp, temp, id=id, event=event(years, status))
+temp <- tmerge(temp, pbc2, id=id, serBilir=tdc(year, serBilir))
+head(temp, 11)
+```
+
+```{r cox_tvc_model}
+# Extended Cox model with treatment and time-dependent serum bilirubin
+ms3 <- coxph(Surv(tstart, tstop, event=='dead') ~ drug + sex + I(age-50) + log(serBilir), data=temp)
+summary(ms3)
+```
+
+Later, we will compare these results to those obtained from a joint regression model.
+
+# Joint regression models
+
+## Basic models
+
+Joint regression models are fit using <tt>jointModel</tt>; see <tt>?jointModel</tt> for details. The key inputs are: <tt>lmeObject</tt>, a linear mixed-effects model for the longitudinal marker; <tt>survObject</tt>, a standard Cox regression model for the survival outcome; <tt>timeVar</tt>, a time variable that corresponds to the time variable used in the mixed-effects model and that is on the same scale as the survival outcome; and a <tt>method</tt> for specifying the baseline hazard function, the parameterization of the relative risk model, and the procedure for numerical integration (<tt>weibull-PH-aGH</tt> is the default). Note that the underlying datasets to which the longitudinal and survival submodels are fit (e.g., <tt>pbc2</tt> and <tt>pbc2.id</tt>, respectively) need to be in the same order (e.g., by <tt>id</tt>). See <tt>?jointModelObject</tt> for a description of the objects returned by <tt>jointModel</tt>.
+
+Using <tt>jointModel</tt>, fit a series of joint models with alternative specifications for the baseline hazard function: a parametric Weibull distribution, a piecewise constant step function, and regression splines. Recall that <tt>ml4</tt> is the fitted mixed-effects model and <tt>ms1</tt> is the fitted Cox regression model. NB: <tt>survObject</tt> is *not* the extended Cox model that includes serum bilirubin as a time-dependent covariate (e.g., <tt>ms3</tt>). 
+
+```{r joint_models_basic}
+# Weibull hazard function
+mj1 <- jointModel(lmeObject=ml4, survObject=ms1, timeVar='year', method='weibull-PH-aGH')
+summary(mj1)
+
+# Piecewise constant step function
+mj2 <- jointModel(lmeObject=ml4, survObject=ms1, timeVar='year', method='piecewise-PH-aGH')
+summary(mj2)
+
+# Regression splines
+mj3 <- jointModel(lmeObject=ml4, survObject=ms1, timeVar='year', method='spline-PH-aGH')
+summary(mj3)
+```
+
+The estimates under <tt>Variance Components</tt> correspond to the variance components of the linear mixed-effects model for (log) serum bilirubin (i.e., $D$ and $\sigma$). The coefficients under <tt>Longitudinal Process</tt> correspond to those in the linear-mixed effects model for (log) serum bilirubin (i.e., $\beta$). The coefficients under <tt>Event Process</tt> correspond to those in the standard Cox regression model for survival (i.e., $\gamma$), plus the coefficient that measures the association between the value of the subject-specific evolution (i.e., <tt>Assoct</tt>) and the event hazard (i.e., $\alpha$), and any parameters for the baseline hazard function.
+
+According to the AIC, <tt>mj1</tt> (Weibull relative risk model) provides a comparatively better fit to the data. According to this model, there is no difference in the average trend in bilirubin levels between the placebo and treatment groups $(P=`r round(summary(mj1)$'CoefTable-Long'[3,4],2)`)$. There is a strong association between bilirubin levels and mortality: hazard ratio, $\exp(`r round(summary(mj1)$'CoefTable-Event'[5,1],3)`) = `r round(exp(summary(mj1)$'CoefTable-Event'[5,1]),3)`$. The lecture notes provide tables that compare the coefficients and standard errors obtained from separate and joint analyses.
+
+Although likelihood-based methods require several assumptions (e.g., the likelihood function is correctly specified) and can be computationally demanding, the availability of a likelihood permits likelihood-based hypothesis tests of nested models. With joint regression models, we can conduct a hypothesis test for a combination of parameters in the longitudinal and/or survival submodels. For example, we can test whether there was any effect of treatment on either serum bilirubin or mortality by evaluating the null hypothesis $H: \beta_2=\gamma_1=0$. This involves fitting the 'null' model (without <tt>drug</tt> in either the longitudinal or survival submodels) and conducting a likelihood ratio test.
+
+```{r joint_lr_test}
+ml0 <- lme(log(serBilir) ~ year, random = ~ year | id, data=pbc2)
+ms0 <- coxph(Surv(years, status=='dead') ~ sex + age, data=pbc2.id, x=TRUE)
+mj0 <- jointModel(lmeObject=ml0, survObject=ms0, timeVar='year', method='weibull-PH-aGH')
+anova(mj0, mj1)
+```
+
+There is no evidence of a treatment effect on either serum bilirubin or mortality.
+
+## Model diagnostics
+
+Residual analysis can be used to evaluate the adequacy of a fitted joint regression model. See <tt>?residuals.jointModel</tt> and <tt>?fitted.jointModel</tt> for details on extracting the residuals and fitted values, respectively, from a <tt>jointModel</tt> object. In particular, there are various options for extracting residuals and fitted values for the longitudinal and survival submodels.
+
+```{r joint_diagnostics}
+plotResid <- function(x, y, col.lowess='red', ...){
+  plot(x, y, ...)
+  abline(h=0, col='gray', lwd=2)
+  lines(lowess(x, y), col=col.lowess, lwd=2)}
+plotQQ <- function(x, ...){
+  qqnorm(x, main='')
+  qqline(x, col='gray', lwd=2)}
+
+r_l_s <- residuals(mj1, process='Longitudinal', type='stand-Subject')
+f_l_s <- fitted(mj1, process='Longitudinal', type='Subject')
+r_l_m <- residuals(mj1, process='Longitudinal', type='stand-Marginal')
+f_l_m <- fitted(mj1, process='Longitudinal', type='Marginal')
+r_s <- residuals(mj1, process='Event', type='Martingale')
+f_s <- fitted(mj1, process='Longitudinal', type='EventTime')
+
+par(mfrow=c(2,2), mar=c(5,5,1,1))
+plotResid(f_l_s, r_l_s, xlab='Fitted values (subject)', ylab='Residuals (subject)')
+plotQQ(r_l_s)
+plotResid(f_l_m, r_l_m, xlab='Fitted values (marginal)', ylab='Residuals (marginal)')
+plotResid(f_s, r_s, xlab='Fitted values (longitudinal)', ylab='Residuals (Martingale)')
+```
+
+(Longitudinal) The plot of subject-specific residuals versus fitted values (upper left panel) indicates no systematic departure from constant variance. The quantile-quantile plot of subject-specific residuals (upper right panel) could indicate a departure from normality, but this is often difficult to judge; it's certainly better than if we had not log-transformed the outcome. The plot of marginal residuals versus fitted values (lower left panel) shows a clear trend. This trend could indicate that the mean model is not correctly specified. However, serum bilirubin is positively associated with mortality, such that lack of fit could be due to the impact of missing data. This motivates the use of multiple imputation residuals (&sect;6.3), in which the observed data are augmented with randomly imputed longitudinal outcomes under the complete-data model, corresponding to the longitudinal outcomes that would have been observed had the participant not died. The code to accomplish this is a bit dense, so is not displayed here.
+
+```{r joint_mi_residuals, echo=FALSE, cache=TRUE}
+# Multiple imputation residuals
+set.seed(4)
+M <- 5
+diff.time <- with(pbc2, tapply(year, id, diff))
+prev.y <- with(pbc2, tapply(log(serBilir), id, head, -1))
+one.visit <- sapply(diff.time, length)==0
+diff.time[one.visit] <- prev.y[one.visit] <- NA
+dataVT <- data.frame(
+  'id'=rep(names(prev.y), sapply(prev.y, length)),
+  'diff.Times'=unlist(diff.time),
+  'prev.y'=unlist(prev.y),
+  'event'=1)
+WeibFrl <- weibull.frailty(Surv(diff.Times, event) ~ prev.y, id='id', data=dataVT)
+attr(WeibFrl, 'prev.y') <- 'prev.y'
+resMargY <- residuals(mj1, process='Longitudinal', type='stand-Marginal')
+fitMargY <- fitted(mj1, process='Longitudinal', type='Marginal')
+resMI <- residuals(mj1, type='stand-Marginal', MI=TRUE, M=10, time.points=WeibFrl)
+fitMargYmiss <- unlist(resMI$fitted.valsM)
+resMargYmiss <- unlist(resMI$resid.valsM)
+resMargYmi <- c(resMargY, resMargYmiss)
+fitMargYmi <- c(fitMargY, fitMargYmiss)
+datRes <- data.frame(resid=resMargYmi, fitted=fitMargYmi,
+                     weight=c(rep(1, length(resMargY)), rep(1/M, length(resMargYmiss))))
+fitLoess <- loess(resid ~ fitted, weights=weight, data=datRes)
+nd <- data.frame(fitted=seq(min(datRes$fitted, na.rm=TRUE), 
+                            max(datRes$fitted, na.rm=TRUE), 
+                            length.out=100))
+prdLoess <- predict(fitLoess, nd)
+
+par(mfrow=c(1,1), mar=c(5,5,1,1))
+plot(range(fitMargYmiss, na.rm=TRUE), range(resMargYmiss, na.rm=TRUE), 
+     type='n', xlab='Fitted values (marginal)', ylab='Residuals (marginal)',
+     ylim=c(-10,10))
+points(fitMargYmiss, resMargYmiss, cex=0.5, col='gray')
+points(fitMargY, resMargY)
+abline(h=0, col='black', lwd=2)
+lines(lowess(fitMargY, resMargY), col='red', lwd=2)
+lines(nd$fitted, prdLoess, col='blue', lwd=2)
+```
+
+The smoother based on the complete data (blue line) does not exhibit the systematic trend that was clearly exhibited by the smoother based on the observed data (red line). Therefore, the specification for the mean model appears to be adequate.
+
+(Survival) The plot of Martingale residuals versus fitted values (lower right panel of the previous figure) does not indicate a systematic departure from linearity.
+
+## Advanced models
+
+Use the <tt>interFact</tt> argument to specify an interaction between serum bilirubin and treatment in the survival submodel.
+
+```{r joint_interaction}
+mj4 <- jointModel(lmeObject=ml4, survObject=ms1, timeVar='year', method='weibull-PH-aGH',
+                  interFact=list(value = ~ drug, data=pbc2.id))
+summary(mj4)
+```
+
+There is no evidence that the association between serum bilirubin and mortality differs between treatment groups.
+
+So far, we have assumed that the association between serum bilirubin and mortality is fully captured by the value of the subject-specific evolution, which changes over time. (This is what is denoted by <tt>Parameterization: Time-dependent</tt> in the joint model output.) However, we can also allow the association between serum bilirubin and mortality to depend on the slope (or rate of change) of the subject-specific evolution, which could also change over time depending on how we parameterize the model. 
+
+Consider a model with time variable $t$, group variable $g$, and $m_i(t) = \beta_0 + \beta_1 t + \beta_2 g_i\times t + b_{i0} + b_{i1}t$; this model corresponds to <tt>ml4</tt>, which is linear in time. Then $m'_i(t) = \beta_1 + \beta_2 g_i + b_{i1}$. Math fact: if $f(x)=ax+b$, then $f'(x)=a$. To fit the model, specify <tt>parameterization="both"</tt> and provide a <tt>derivForm</tt> argument, which includes formulas for the derivatives of the fixed-effects and random-effects components with respect to time, as well as numeric vectors to indicate which variables in <tt>lmeObject</tt> correspond to the derivatives.
+
+```{r joint_slopes}
+# Level and slope models for serum bilirubin in survival submodel
+# Linear time effects
+dFormL <- list(fixed = ~ 1 + drug, indFixed=c(2,3), random = ~ 1, indRandom=2)
+mj5 <- jointModel(lmeObject=ml4, survObject=ms1, timeVar='year', method='weibull-PH-aGH',
+                  parameterization='both', derivForm=dFormL)
+summary(mj5)
+```
+
+Note that the model output now indicates <tt>Parameterization: Time-dependent + time-dependent slope</tt>. According to this model, there is strong evidence that both the value and slope of serum bilirubin are associated with mortality, as indicated by the coefficients for <tt>Assoct</tt> and <tt>Assoct.s</tt>, respectively. However, because the longitudinal submodel is linear in time, its slope is constant (i.e., does not change over time). We can obtain a non-constant slope by fitting a longitudinal submodel that is non-linear in time. For example, consider a linear-quadratic function for time. The model specification is a bit messy, but doable thanks to [calculus](http://en.wikipedia.org/wiki/Calculus). Math fact: if $f(x)=ax^2 + bx + c$, then $f'(x)=2ax + b$.
+
+```{r joint_quad}
+# Quadratic time effects
+ml6 <- lme(log(serBilir) ~ drug*(year + I(year^2)), random = ~ year + I(year^2) | id, data=pbc2)
+dFormQ <- list(fixed = ~ 1 + I(2*year) + drug + I(2*year):drug, indFixed=3:6, 
+               random = ~ 1 + I(2*year), indRandom=2:3)
+mj6 <- jointModel(lmeObject=ml6, survObject=ms1, timeVar='year', method='weibull-PH-aGH',
+                  parameterization='both', derivForm=dFormQ)
+summary(mj6)
+anova(mj5, mj6)
+```
+
+The quadratic terms substantially improve model fit, as indicated by AIC and the likelihood ratio test. There remains strong evidence that both the value and slope of serum bilirubin are associated with mortality.
+
+NB: fitting more complex models requires more computation time. In addition, fitting models to larger datasets can be computationally demanding.
+
+## Prediction
+
+The development and evaluation of risk-prediction models is a complex topic. (In fact, there are other modules devoted to the topic at SISCER.) Below are some commands to obtain and display dynamic predictions of conditional survival from a joint regression model. See <tt>?survfitJM</tt> and <tt>?plot.survfitJM</tt> for details.
+
+```{r joint_predict, fig.height=3, fig.width=9}
+ND <- subset(pbc2, id==15)
+survPreds <- vector('list', nrow(ND))
+for(i in 1:nrow(ND)){
+  set.seed(4)
+  survPreds[[i]] <- survfitJM(mj6, newdata=ND[1:i,])}
+
+par(mfrow=c(1,3))
+for(i in c(3,6,9)){
+  plot(survPreds[[i]], estimator='median', conf.int=TRUE, include.y=TRUE, pch=19, lwd=2, col='blue',
+       xlab='', ylab='', ylab2='', main=paste(round(survPreds[[i]]$last.time, 1), 'years'))}
+mtext('Time, years', side=1, line=-2, outer=TRUE)
+mtext('log serum bilirubin', side=2, line=-1, outer=TRUE)
+mtext('Survival probability', side=4, line=-1, outer=TRUE)
+```
+
+At year `r round(survPreds[[3]]$last.time, 1)`, serum bilirubin (value) remains low, with almost no change (slope); predicted survival is relatively favorable for this participant. However, at year `r round(survPreds[[6]]$last.time, 1)`, serum bilirubin begins to increase, with a corresponding decrease in predicted survival. At year `r round(survPreds[[9]]$last.time, 1)`, serum bilirubin increases further; predicted survival is relatively poor. The participant died at year `r round(pbc2.id$years[pbc2.id$id==15], 1)`.
+
+# End matter
+
+This file was created from:
+```{r session_info, echo=FALSE}
+print(sessionInfo(), locale = FALSE)
+```
