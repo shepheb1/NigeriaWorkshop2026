@@ -1,0 +1,344 @@
+---
+title: "DAY 2"
+author: "Abdurrahman Abdulhamid"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+```{r}
+rm(list=ls())
+graphics.off()
+```
+
+
+```{r}
+
+library(geepack)
+
+library(dplyr)
+
+library(ggplot2)
+
+
+library(lme4)
+library(JM)
+```
+
+```{r}
+
+library(Hmisc)
+library(lme4)
+library(geepack)
+library(JM)
+library(survival)
+library(ggplot2)
+library(mice)
+library(purrr)
+library(dplyr)
+library(gtsummary)
+library(data.table)
+library(broom)
+library(readr)
+```
+
+```{r}
+d.cd4 <- read.csv("d.cd4.csv")
+
+d.vl <- read.csv("d.vl.csv")
+
+```
+
+
+
+```{r}
+d.cd4 <- d.cd4 %>%
+  
+  mutate(
+    
+    patient_id = factor(patient_id),
+    
+    Male_y = factor(male_y,
+                    levels = c(0, 1),
+                    labels = c("Female", "Male")),
+    
+    mode = factor(mode),
+    
+    class = factor(class),
+    
+    time_yr = days.art / 365.25
+  )
+```
+
+
+```{r}
+d.vl <- d.vl %>%
+  
+  mutate(
+    
+    patient_id = factor(patient_id),
+    
+    male_y = factor(male_y,
+                    levels = c(0, 1),
+                    labels = c("Female", "Male")),
+    
+    mode = factor(mode),
+    
+    class = factor(class),
+    
+    time_yr = days.art / 365.25
+  )
+```
+
+```{r}
+cd4_brazil <- d.cd4 %>%
+  filter(country == "Brazil")
+
+vl_brazil <- d.vl %>%
+  filter(country == "Brazil")
+```
+
+```{r}
+head(cd4_brazil)
+
+head(vl_brazil)
+
+table(cd4_brazil$male_y)
+
+table(vl_brazil$male_y)
+
+length(unique(cd4_brazil$patient_id))
+
+length(unique(vl_brazil$patient_id))
+```
+
+
+```{r}
+ggplot(cd4_brazil, aes(x = time_yr, y = cd4_v)) +
+  
+  geom_point(alpha = 0.15) +
+  
+  geom_smooth(se = TRUE) +
+  
+  labs(
+    title = "CD4 count over time after ART initiation in Brazil",
+    x = "Years after ART initiation",
+    y = "CD4 count"
+  ) +
+  
+  theme_minimal()
+```
+
+```{r}
+
+cd4_summary <- cd4_brazil %>%
+  
+  mutate(year_group = floor(time_yr)) %>%
+  
+  group_by(year_group) %>%
+  
+  summarise(
+    mean_cd4 = mean(cd4_v, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(cd4_summary, aes(x = year_group, y = mean_cd4)) +
+  
+  geom_point(size = 2) +
+  
+  geom_line() +
+  
+  labs(
+    title = "Average CD4 count by year after ART in Brazil",
+    x = "Years after ART initiation",
+    y = "Mean CD4 count"
+  ) +
+  
+  theme_minimal()
+```
+
+```{r}
+
+gee_cd4_ind_unadj <- geeglm(
+  
+  cd4_v ~ time_yr*class ,
+  
+  family = gaussian,
+  
+  data = cd4_brazil,
+  
+  id = patient_id,
+  
+  corstr = "independence"
+)
+
+summary(gee_cd4_ind_unadj)
+
+```
+
+
+```{r}
+
+gee_cd4_ind <- geeglm(
+  
+  cd4_v ~ time_yr + male_y + mode + age + class * time_yr + cd4.baseline,
+  
+  family = gaussian,
+  
+  data = cd4_brazil,
+  
+  id = patient_id,
+  
+  corstr = "independence"
+)
+
+summary(gee_cd4_ind)
+```
+
+```{r}
+gee_cd4_exch_unadj <- geeglm(
+  
+  cd4_v ~ time_yr* class ,
+  
+  family = gaussian,
+  
+  data = cd4_brazil,
+  
+  id = patient_id,
+  
+  corstr = "exchangeable"
+)
+
+summary(gee_cd4_exch_unadj)
+```
+
+
+```{r}
+gee_cd4_exch <- geeglm(
+  
+  cd4_v ~ time_yr + male_y + mode + age + class * time_yr + cd4.baseline,
+  
+  family = gaussian,
+  
+  data = cd4_brazil,
+  
+  id = patient_id,
+  
+  corstr = "exchangeable"
+)
+
+summary(gee_cd4_exch)
+```
+
+```{r}
+ggplot(vl_brazil, aes(x = time_yr, y = detect_vl)) +
+  
+  geom_jitter(height = 0.05, width = 0, alpha = 0.15) +
+  
+  geom_smooth(
+    method = "glm",
+    method.args = list(family = "binomial"),
+    se = TRUE
+  ) +
+  
+  labs(
+    title = "Detectable viral load over time after ART initiation in Brazil",
+    x = "Years after ART initiation",
+    y = "Detectable viral load: 1 = Yes, 0 = No"
+  ) +
+  
+  theme_minimal()
+```
+
+
+```{r}
+vl_summary <- vl_brazil %>%
+  
+  mutate(year_group = floor(time_yr)) %>%
+  
+  group_by(year_group) %>%
+  
+  summarise(
+    prop_detectable = mean(detect_vl, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(vl_summary, aes(x = year_group, y = prop_detectable)) +
+  
+  geom_point(size = 2) +
+  
+  geom_line() +
+  
+  labs(
+    title = "Proportion with detectable viral load by year after ART in Brazil",
+    x = "Years after ART initiation",
+    y = "Proportion detectable"
+  ) +
+  
+  theme_minimal()
+```
+
+```{r}
+]gee_vl_ind <- geeglm(
+  
+  detect_vl ~ time_yr + male_y + mode + age + class * time_yr + cd4.base,
+  
+   family = binomial,
+  
+   data = vl_brazil,
+  
+   id = patient_id,
+  
+   corstr = "independence"
+)
+
+summary(gee_vl_ind)
+
+exp(coef(gee_vl_ind))
+```
+
+
+```{r}
+gee_vl_exch <- geeglm(
+  
+  detect_vl ~ time_yr + male_y + mode + age + class * time_yr + cd4.base,
+  
+  family = binomial,
+  
+  data = vl_brazil,
+  
+  id = patient_id,
+  
+  corstr = "exchangeable"
+)
+
+summary(gee_vl_exch)
+
+exp(coef(gee_vl_exch))
+```
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
