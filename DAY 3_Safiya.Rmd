@@ -1,0 +1,290 @@
+---
+title: "VNBIOSTAT2026"
+output: html_document
+date: "2026-04-20"
+---
+
+Data Analysis with Synthetic CCASAnet Dataset Day 3.
+
+GLMM analysis: 
+
+-Estimate change over time after ART initiation in CD4 count. Consider adjusting for covariates and investigating potential interactions between time and covariates. 
+
+-Estimate change over time after ART initiation in viral load (detectable vs. undetectable). Consider adjusting for covariates and investigating potential interactions between time and covariates.
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(lme4)
+library(lmerTest)  # for p-values
+
+# Read data
+d.cd4 <- read.csv("C:/Users/sssan/OneDrive/Desktop/VN_BIOSTAT 2026/d.cd4.csv")
+hist(d.cd4$cd4_v)
+hist(sqrt(d.cd4$cd4_v))
+d.cd4$sqrt.cd4<-sqrt(d.cd4$cd4_v)
+```
+
+Clean and transform variables
+
+```{r}
+d.cd4 <- d.cd4 %>%
+  filter(!is.na(cd4_v), !is.na(days.art)) %>%
+  mutate(
+    time_yrs = days.art / 365.25,
+    male = factor(male_y, labels = c("Female", "Male")),
+    country = factor(country),
+    class = factor(class)
+  )
+```
+
+Basic Linear Mixed Model (random intercept)
+
+```{r}
+mod0 <- lmer(sqrt.cd4 ~ time_yrs + (1 | patient_id), data = d.cd4)
+summary(mod0)
+```
+
+Interpretation:
+
+At baseline, the average CD4 count is about 18.5 on the square‑root scale, roughly 342 cells/µL if you back‑transform.
+
+Over time, CD4 increases by about 2 × 18.5 × 0.546, roughly 20 cells per year on average.
+
+There is substantial variation between patients in their starting CD4 levels (between‑patient variability about 3× larger than within‑patient variability; SD = 5.24 on sqrt scale ≈ 55 cells/µL on original scale), and those starting higher tend to improve a bit more slowly (correlation coefficient = −0.23; mild negative correlation).
+
+```{r Adjusted GLMM}
+mod1 <- lmer(sqrt.cd4 ~ (1 | patient_id) + time_yrs + cd4.baseline + age + male + class, data = d.cd4, subset=country=="Argentina")
+
+summary(mod1)
+```
+
+Among Argentinian patients, CD4 counts rise steadily over time, increasing by roughly 19 cells per year. (2 X 16.4 x 0.57)
+
+Those with higher baseline CD4 remain higher throughout follow‑up. Age and sex don’t significantly affect CD4 recovery, but patients on NNRTI or other regimens show lower CD4 trajectories compared with the reference class.
+
+```{r}
+### Including a random slope because patients may improve at different rates, not just different baselines.
+
+mod2 <- lmer(sqrt.cd4 ~ time_yrs + (time_yrs | patient_id) + cd4.baseline + age + male + class, data = d.cd4, subset=country=="Argentina")
+
+summary(mod2)
+```
+
+```{r}
+# Model comparison
+anova(mod1,mod2)
+```
+
+```{r}
+# Interaction with class of ART
+mod3 <- lmer(sqrt.cd4 ~ (1 | patient_id) + time_yrs*class + cd4.baseline + age + male, data = d.cd4, subset=country=="Argentina")
+
+summary(mod3)
+```
+
+```{r}
+# Interaction 
+mod4 <- lmer(sqrt.cd4 ~ (time_yrs | patient_id) + time_yrs*class + cd4.baseline + age + male, data = d.cd4, subset=country=="Argentina")
+
+summary(mod4)
+```
+
+```{r}
+# Model comparisons
+anova(mod3,mod4)
+```
+
+GLMM: Detectable vs Undetectable Viral Load
+
+```{r}
+# Load required libraries
+library(tidyverse)
+library(lubridate)
+library(survival)
+library(ggplot2)
+ d.vl <- read.csv("C:/Users/sssan/OneDrive/Desktop/VN_BIOSTAT 2026/d.vl.csv")
+```
+
+Inspect and Clean Viral Load Data
+
+```{r}
+# Structure and summary
+str(d.vl)
+summary(d.vl)
+```
+
+```{r}
+# Check missing viral load values
+sum(is.na(d.vl$vl))
+
+d.vl <- d.vl %>%
+  mutate(
+    time_yrs = days.art / 365.25,
+    male = factor(male_y, labels = c("Female", "Male")),
+    country = factor(country),
+    detect_vl = factor(detect_vl, labels=c("Undetectable","Detectable")),
+    class = factor(class)
+  )
+
+```
+
+Descriptive Statistics (Overall & by Sex)
+
+```{r}
+# Overall summary
+d.vl %>%
+  count(detect_vl) %>%
+  mutate(pct = n / sum(n) * 100)
+
+# By sex
+library(janitor)
+d.vl %>%
+  tabyl(male, detect_vl) %>%
+  adorn_percentages("row") %>%
+  adorn_pct_formatting()
+```
+
+```{r}
+d.vl.sub <- subset(d.vl, country == "Brazil")  # 
+#Argentina    Brazil     Chile     Haiti  Honduras    Mexico 
+
+mod5 <- glmer(detect_vl ~ time_yrs + (1 | patient_id), data = d.vl.sub, family = binomial)
+summary(mod5)
+```
+
+Baseline log-odds of detectable viral load = 0.024, odds = 1.024, probability = 0.506. This means that at baseline, about half the patients have detectable viral load.
+
+A slight increase in odds by 1.4% per year but it is not significant.
+
+```{r}
+
+# Random-intercept model
+mod6 <- glmer(detect_vl ~ I(time_yrs/100) + (1 | patient_id) +  male + I(age/100) + class*I(time_yrs/100) + I(cd4.base/1000), data = d.vl.sub, family = binomial(link="logit"), control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5)))
+
+summary(mod6)
+
+exp(fixef(mod6))   # Odds ratios
+```
+```{r}
+# Extract coefficients for scaled variables
+coefs <- fixef(mod6)[c(2,4,8)]  
+
+# Odds ratios for scaled variables 
+OR_scaled <- exp(coefs)
+
+# Rescale to natural units before exponentiating
+coefs_rescaled <- coefs
+coefs_rescaled["I(time_yrs/100)"] <- coefs["I(time_yrs/100)"] / 100   # per year
+coefs_rescaled["I(age/100)"]      <- coefs["I(age/100)"] / 100        # per year
+coefs_rescaled["I(cd4.base/1000)"] <- coefs["I(cd4.base/1000)"] / 10  # per 100 cells
+
+# Odds ratios for natural units
+OR_rescaled <- exp(coefs_rescaled)
+
+# Combine into a table for clarity
+results <- data.frame(
+  Variable = names(coefs),
+  Estimate = coefs,
+  OR_scaled = OR_scaled,
+  OR_rescaled = OR_rescaled
+)
+
+print(results)
+
+```
+
+
+```{r}
+# Random slope for time
+
+mod7 <- glmer(detect_vl ~ I(time_yrs/100) + (time_yrs | patient_id) +  male + I(age/100) + class*I(time_yrs/100) + I(cd4.base/1000), data = d.vl.sub, family = binomial(link="logit"), control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5)))
+summary(mod7)
+exp(fixef(mod7))   # Odds ratios
+
+```
+
+```{r}
+anova(mod6, mod7)
+```
+
+```{r}
+# Time × sex interaction
+mod8 <- glmer(detect_vl ~ I(time_yrs/100) * male + (1 | patient_id) + I(age/100) + class + I(cd4.base/1000), data = d.vl.sub, family = binomial, control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5)))
+summary(mod8)
+exp(fixef(mod8))
+```
+
+```{r}
+# Random slope for time
+mod9 <- glmer(detect_vl ~ I(time_yrs/100) * male + (time_yrs | patient_id) + I(age/100) + class + I(cd4.base/1000), data = d.vl.sub, family = binomial, control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5)))
+
+summary(mod9)
+exp(fixef(mod9))
+```
+
+```{r}
+anova(mod8, mod9)
+```
+
+```{r}
+# Predicted probability of suppression over time
+
+library(ggeffects)
+
+pp_time <- ggpredict(
+  mod9,
+  terms = "time_yrs [0:15]"
+)
+
+ggplot(pp_time, aes(x = x, y = predicted)) +
+  geom_line(size = 1.2) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high),
+              alpha = 0.2) +
+  labs(
+    x = "Years since ART initiation",
+    y = "Predicted probability of viral suppression",
+    title = "Viral Suppression After ART Initiation"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Time × sex interaction plot
+pp_sex <- ggpredict(
+  mod9,
+  terms = c("time_yrs [0:15]", "male")
+)
+
+ggplot(pp_sex,
+       aes(x = x, y = predicted, color = group)) +
+  geom_line(size = 1.2) +
+  labs(
+    x = "Years since ART initiation",
+    y = "Predicted probability of viral suppression",
+    color = "Sex",
+    title = "Differential Viral Suppression by Sex"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Subject‑specific fitted trajectories
+
+d.vl.sub$pred <- predict(mod9, type = "response")
+
+ggplot(
+  d.vl.sub |> dplyr::sample_n(200, replace = TRUE),
+  aes(x = time_yrs, y = pred, group = patient_id)
+) +
+  geom_line(alpha = 0.3) +
+  labs(
+    x = "Years since ART",
+    y = "Predicted probability",
+    title = "Subject-Specific Viral Suppression Trajectories"
+  ) +
+  theme_minimal()
+
+
+
+```
