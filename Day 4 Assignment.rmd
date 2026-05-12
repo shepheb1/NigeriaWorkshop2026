@@ -1,0 +1,193 @@
+---
+title: "Simulation"
+author: "Dr. Ibrahim"
+date: "2026-04-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+rm(list=ls())
+```
+
+```{r}
+library(mice)
+```
+
+
+#  Read the  dataset
+```{r}
+d.cd4<-read.csv("d.cd4.csv")
+ord<-order(d.cd4$patient_id, d.cd4$days.art)
+d.cd4<-d.cd4[ord,]
+head(d.cd4)
+```
+
+
+```{r}
+d.cd4$mode1 <- d.cd4$mode
+d.cd4$mode1[d.cd4$mode == "unknown"] <- NA
+```
+
+# distribution of each category
+```{r}
+table(d.cd4$mode1, useNA = "ifany")
+```
+
+
+# percentage distribution of each category
+```{r}
+prop.table(table(d.cd4$mode1, useNA = "ifany")) * 100
+```
+
+
+# created a reduced dataset containing only the variables needed for the analysis and imputation
+```{r}
+d.cd4.reduced <- d.cd4[, c("patient_id","country","days.art",
+                          "male_y","mode1","age","class",
+                          "cd4.baseline","cd4_v")]
+```
+
+# converted mode1 into a factor variable
+```{r}
+d.cd4.reduced$mode1 <- as.factor(d.cd4.reduced$mode1)
+```
+
+
+
+
+# complete case analysis
+```{r}
+mod.gee.b <- geeglm(cd4_v ~ days.art + mode1 + male_y + age + 
+                    class*days.art + cd4.baseline,
+                    family="gaussian",
+                    id=patient_id,
+                    data=d.cd4.reduced,
+                    subset=(country=="Brazil" & !is.na(mode1)),
+                    corstr="exchangeable")
+```
+
+
+```{r}
+mod.gee.b
+```
+
+
+# Multiple Imputation
+```{r}
+
+Nimps <- 10
+
+d.imputed <- mice(d.cd4.reduced,
+                  method = "pmm",
+                  m = Nimps,
+                  seed = 10)
+```
+
+
+# GEE model on each of the imputed datasets
+```{r}
+mod.gee.i <- with(d.imputed,
+                  geeglm(cd4_v ~ days.art + male_y + mode1 + age +
+                         class*days.art + cd4.baseline,
+                         family="gaussian",
+                         id=patient_id,
+                         subset=country=="Brazil",
+                         corstr="exchangeable"))
+```
+
+
+
+# combined the results (Rubin’s Rule) which combines estimates and adjusts standard errors
+```{r}
+pooled_results <- pool(mod.gee.i)
+pooled_results
+```
+
+# flat dataset, where each patient appears only once instead of multiple times.
+```{r}
+d.cd4.flat1<-d.cd4[!duplicated(d.cd4$patient_id),
+                   c("patient_id","country","days.art","male_y","mode1","age","class","cd4.baseline","cd4_v")]
+d.cd4.flat1$mode1<-as.factor(d.cd4.flat1$mode1)
+
+```
+
+
+
+
+
+# wide dataset
+```{r}
+d.imp1 <- mice(d.cd4.flat1, method="pmm", m=Nimps, seed=10)
+```
+
+
+
+# CD4 measurements over time
+```{r}
+d.cd4.small <- d.cd4[, c("patient_id","country","days.art","cd4_v")]
+```
+
+
+
+
+# matrices to stores the regression coefficients, and variances
+```{r}
+ests <- vars <- matrix(NA, 
+                       nrow = length(mod.gee.b$coefficients), 
+                       ncol = Nimps)
+```
+
+
+```{r}
+#loop through each of the 10 imputed datasets. 
+for (i in 1:Nimps) {
+  d1 <- complete(d.imp1, action = i)
+
+  # removed variables that are not needed from the imputed dataset to avoid duplication when merging.This ensures that we only retain the patient-level variables from the imputation  
+  
+  d1$cd4_v <- d1$country <- d1$days.art <- NULL
+  
+  
+  #Next, I merged the imputed patient-level dataset with the longitudinal CD4 dataset.
+
+#This reconstructs the full dataset with repeated CD4 measurements and imputed covariates.”
+    dnext1 <- merge(d.cd4.small, d1, by="patient_id")
+    
+    #fit the same GEE model on the reconstructed dataset for each imputation.
+
+      mod.gee.imp <- geeglm(cd4_v ~ days.art + male_y + mode1 + age + 
+                        class*days.art + cd4.baseline, 
+                        family="gaussian",
+                        id=patient_id,
+                        subset=country=="Brazil",
+                        data=dnext1,
+                        corstr="exchangeable")
+      
+
+# stored the regression coefficients and their variances for each imputed dataset. 
+        ests[,i] <- mod.gee.imp$coefficients
+  vars[,i] <- summary(mod.gee.imp)$coefficients[,2]^2
+}
+    
+```
+
+# calculated the final pooled estimates by taking the average of the coefficients across all imputations.
+
+```{r}
+apply(ests, 1, mean)
+sqrt(apply(vars, 1, mean) + (1 + 1/Nimps) * apply(ests, 1, var))
+
+```
+
+
+#Finally, I compared the results from the wide imputation approach with the earlier long-format imputation results.
+
+```{r}
+pooled_results
+```
+
